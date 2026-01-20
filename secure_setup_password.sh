@@ -11,6 +11,8 @@ MAIN_SSHD_BACKUP="${STATE_DIR}/sshd_config.before"
 HARDEN_FILE="/etc/ssh/sshd_config.d/99-hardening.conf"
 ROLLBACK_SCRIPT="${STATE_DIR}/rollback.sh"
 TIMER_PID_FILE="${STATE_DIR}/rollback.pid"
+ROLLBACK_UNIT_FILE="${STATE_DIR}/rollback.unit"
+ROLLBACK_LOG="/var/log/secure-setup.log"
 UFW_RULES_FILE="${STATE_DIR}/ufw.rules.before"
 
 SSH_PORT_FILE="${STATE_DIR}/ssh_port"
@@ -121,31 +123,42 @@ set_rollback_fuse() {
   local seconds="${1:-600}"
   write_rollback_script
 
+  # 保存当前 iptables 规则用于 best-effort restore（没有也不致命）
   if command -v iptables-save >/dev/null 2>&1; then
     iptables-save > "$UFW_RULES_FILE" || true
   fi
 
-  nohup bash -c "sleep ${seconds}; ${ROLLBACK_SCRIPT}" >/dev/null 2>&1 &
-  echo $! > "$TIMER_PID_FILE"
+  # 每次生成一个唯一 unit 名称，避免重复覆盖/混淆
+  local unit="secure-setup-rollback-$(date +%s)"
+  echo "$unit" > "$ROLLBACK_UNIT_FILE"
+
+  # 用 systemd-run 做一次性定时任务：seconds 后执行回滚脚本
+  systemd-run --quiet --unit "$unit" --on-active="${seconds}s" /usr/bin/env bash "$ROLLBACK_SCRIPT"
+
   echo "已设置自动回滚保险丝：${seconds} 秒后会自动回滚。"
-  echo "确认一切正常后运行：sudo ./${SCRIPT_NAME} --confirm"
+  echo "确认一切正常后运行：sudo ./${SCRIPT_NAME} --confirm 取消保险丝。"
 }
 
 cancel_rollback_fuse() {
-  if [[ -f "$TIMER_PID_FILE" ]]; then
-    local pid
-    pid="$(cat "$TIMER_PID_FILE" || true)"
-    if [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null || true
-      echo "已取消自动回滚保险丝（pid=${pid}）。"
+  if [[ -f "$ROLLBACK_UNIT_FILE" ]]; then
+    local unit
+    unit="$(cat "$ROLLBACK_UNIT_FILE" 2>/dev/null || true)"
+
+    if [[ -n "${unit:-}" ]]; then
+      # 停止并取消（transient unit 常见用法）
+      systemctl stop "$unit" 2>/dev/null || true
+      systemctl reset-failed "$unit" 2>/dev/null || true
+      echo "已取消自动回滚保险丝（unit=${unit}）。"
     else
-      echo "未找到正在运行的保险丝进程（可能已执行或已结束）。"
+      echo "保险丝 unit 文件为空，忽略。"
     fi
-    rm -f "$TIMER_PID_FILE" || true
+
+    rm -f "$ROLLBACK_UNIT_FILE" || true
   else
     echo "没有检测到保险丝（无需取消）。"
   fi
 }
+
 
 do_rollback_now() {
   write_rollback_script
