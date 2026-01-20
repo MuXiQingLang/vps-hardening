@@ -10,7 +10,6 @@ MAIN_SSHD_BACKUP="${STATE_DIR}/sshd_config.before"
 
 HARDEN_FILE="/etc/ssh/sshd_config.d/99-hardening.conf"
 ROLLBACK_SCRIPT="${STATE_DIR}/rollback.sh"
-TIMER_PID_FILE="${STATE_DIR}/rollback.pid"
 ROLLBACK_UNIT_FILE="${STATE_DIR}/rollback.unit"
 ROLLBACK_LOG="/var/log/secure-setup.log"
 UFW_RULES_FILE="${STATE_DIR}/ufw.rules.before"
@@ -66,22 +65,30 @@ set -euo pipefail
 STATE_DIR="/var/lib/secure-setup"
 HARDEN_FILE="/etc/ssh/sshd_config.d/99-hardening.conf"
 UFW_RULES_FILE="${STATE_DIR}/ufw.rules.before"
-TIMER_PID_FILE="${STATE_DIR}/rollback.pid"
 MAIN_SSHD_CONFIG="/etc/ssh/sshd_config"
 MAIN_SSHD_BACKUP="${STATE_DIR}/sshd_config.before"
+ROLLBACK_LOG="/var/log/secure-setup.log"
+
+# 写回滚日志（用于确认什么时候触发、谁触发）
+touch "$ROLLBACK_LOG" 2>/dev/null || true
+chmod 600 "$ROLLBACK_LOG" 2>/dev/null || true
+echo "[ROLLBACK] $(date -Is) triggered user=$(id -un) pid=$$ ppid=$PPID" >> "$ROLLBACK_LOG"
 
 echo "[ROLLBACK] 开始回滚..."
+echo "[ROLLBACK] start" >> "$ROLLBACK_LOG"
 
-# 1) 禁用 SSH 加固文件
+# 1) 禁用 SSH 加固文件（搬到 /root 留档）
 if [[ -f "$HARDEN_FILE" ]]; then
   mv "$HARDEN_FILE" "/root/99-hardening.conf.disabled.rollback.$(date +%F-%H%M%S)" || true
   echo "[ROLLBACK] 已禁用 SSH 加固文件：$HARDEN_FILE"
+  echo "[ROLLBACK] disabled $HARDEN_FILE" >> "$ROLLBACK_LOG"
 fi
 
 # 2) 恢复主 sshd_config（撤销脚本插入的 Include）
 if [[ -f "$MAIN_SSHD_BACKUP" ]]; then
   cp -a "$MAIN_SSHD_BACKUP" "$MAIN_SSHD_CONFIG" || true
   echo "[ROLLBACK] 已恢复主 SSH 配置：$MAIN_SSHD_CONFIG"
+  echo "[ROLLBACK] restored $MAIN_SSHD_CONFIG from backup" >> "$ROLLBACK_LOG"
 fi
 
 # 3) 回滚/放开防火墙
@@ -89,9 +96,11 @@ if command -v ufw >/dev/null 2>&1; then
   if [[ -s "$UFW_RULES_FILE" ]] && command -v iptables-restore >/dev/null 2>&1; then
     iptables-restore < "$UFW_RULES_FILE" || true
     echo "[ROLLBACK] 已通过 iptables-restore 还原防火墙规则（best-effort）"
+    echo "[ROLLBACK] iptables-restore applied" >> "$ROLLBACK_LOG"
   else
     ufw disable || true
     echo "[ROLLBACK] 已执行：ufw disable"
+    echo "[ROLLBACK] ufw disabled" >> "$ROLLBACK_LOG"
   fi
 fi
 
@@ -104,17 +113,17 @@ else
   systemctl restart ssh || systemctl restart sshd || true
 fi
 echo "[ROLLBACK] SSH 服务已重启（best-effort）"
+echo "[ROLLBACK] ssh restarted" >> "$ROLLBACK_LOG"
 
 # 5) 停止 fail2ban（避免误伤）
 if systemctl list-unit-files | grep -q '^fail2ban\.service'; then
   systemctl stop fail2ban || true
   echo "[ROLLBACK] fail2ban 已停止（best-effort）"
+  echo "[ROLLBACK] fail2ban stopped" >> "$ROLLBACK_LOG"
 fi
 
-# 6) 清理保险丝 pid 文件
-rm -f "$TIMER_PID_FILE" || true
-
 echo "[ROLLBACK] 回滚完成。"
+echo "[ROLLBACK] done" >> "$ROLLBACK_LOG"
 EOF
   chmod +x "$ROLLBACK_SCRIPT"
 }
@@ -127,6 +136,9 @@ set_rollback_fuse() {
   if command -v iptables-save >/dev/null 2>&1; then
     iptables-save > "$UFW_RULES_FILE" || true
   fi
+
+  # 先取消旧保险丝（避免堆叠）
+  cancel_rollback_fuse || true
 
   # 每次生成一个唯一 unit 名称，避免重复覆盖/混淆
   local unit="secure-setup-rollback-$(date +%s)"
@@ -145,10 +157,10 @@ cancel_rollback_fuse() {
     unit="$(cat "$ROLLBACK_UNIT_FILE" 2>/dev/null || true)"
 
     if [[ -n "${unit:-}" ]]; then
-      # 停止并取消（transient unit 常见用法）
       systemctl stop "$unit" 2>/dev/null || true
       systemctl reset-failed "$unit" 2>/dev/null || true
       echo "已取消自动回滚保险丝（unit=${unit}）。"
+      echo "[CONFIRM] $(date -Is) canceled unit=${unit} user=$(id -un) pid=$$" >> "$ROLLBACK_LOG" 2>/dev/null || true
     else
       echo "保险丝 unit 文件为空，忽略。"
     fi
@@ -158,7 +170,6 @@ cancel_rollback_fuse() {
     echo "没有检测到保险丝（无需取消）。"
   fi
 }
-
 
 do_rollback_now() {
   write_rollback_script
@@ -214,7 +225,7 @@ Port ${ssh_port}
 # 合并模式：避免把已有可登录用户踢出门
 AllowUsers ${allow_users}
 
-# 禁止 root 直接登录（如需暂时保留 root，请自行改回）
+# 禁止 root 直接登录（确认 muxi 可登录 + 可 sudo 后再长期保持）
 PermitRootLogin no
 
 # 密码登录 + 禁用公钥
@@ -235,7 +246,7 @@ EOF
 assert_sshd_listening_port() {
   local expected="$1"
 
-  # 最可靠：只要看到 ":expected" 且进程是 sshd 就算通过
+  # 朴素可靠：只要看到 ":expected" 且进程是 sshd 就算通过
   if ss -lntp 2>/dev/null | awk -v p=":$expected" '
       $1=="LISTEN" && index($4,p)>0 && $0 ~ /users:\(\("sshd"/ { ok=1 }
       END { exit(ok?0:1) }
@@ -250,6 +261,23 @@ assert_sshd_listening_port() {
   exit 1
 }
 
+grant_sudo_privilege() {
+  local u="$1"
+  echo "[1.5/6] 赋予 ${u} sudo 权限（最高权限，需输入密码）..."
+
+  # 1) 加入 sudo 组（Ubuntu/Debian 常规做法）
+  usermod -aG sudo "${u}" || true
+
+  # 2) 更稳：写 sudoers.d（避免系统未启用 %sudo 导致加组也没用）
+  local f="/etc/sudoers.d/90-${u}"
+  echo "${u} ALL=(ALL:ALL) ALL" > "$f"
+  chmod 440 "$f"
+
+  # 3) 校验 sudoers 语法
+  visudo -cf /etc/sudoers
+
+  echo "已为 ${u} 配置 sudo 权限（需要密码，不是免密）。"
+}
 
 # ---------- args ----------
 need_root
@@ -293,7 +321,7 @@ fi
 echo "============================================"
 echo "   Linux 服务器更稳加固脚本（密码登录版）"
 echo " (Create User + SSH Port + UFW + Fail2Ban)"
-echo " + 自动回滚保险丝 + 一键回滚"
+echo " + systemd 保险丝 + 回滚日志 + 一键回滚"
 echo "============================================"
 
 read -rp "请输入要创建/使用的登录用户名(建议非root，如 ubuntu/debian): " LOGIN_USER
@@ -317,7 +345,7 @@ echo "$KEEP_PORT22" > "$KEEP22_FILE"
 
 echo
 echo "开始处理..."
-echo "（提示：脚本将先设置 10 分钟自动回滚保险丝，避免锁门）"
+echo "（提示：脚本将先设置 10 分钟 systemd 自动回滚保险丝，避免锁门）"
 set_rollback_fuse 600
 
 echo "[0/6] 确保 sshd_config.d 生效..."
@@ -334,6 +362,8 @@ else
     passwd "${LOGIN_USER}"
   fi
 fi
+
+grant_sudo_privilege "${LOGIN_USER}"
 
 echo "[2/6] 写入 SSH 加固配置（密码登录，禁用公钥）..."
 MERGED_ALLOW_USERS="$(compute_allowusers_merge "$LOGIN_USER")"
@@ -402,9 +432,10 @@ echo "AllowUsers(当前合并模式): ${MERGED_ALLOW_USERS}"
 echo "额外放行端口: ${EXTRA_PORTS:-无}"
 echo "UFW 放行 22: $([[ "${KEEP_PORT22}" == "yes" ]] && echo '暂时保留(建议验证后关闭)' || echo '未放行')"
 echo
-echo "重要：当前已设置 10 分钟自动回滚保险丝。"
+echo "重要：当前已设置 10 分钟 systemd 自动回滚保险丝。"
 echo "请立刻新开终端测试：ssh -p ${SSH_PORT} ${LOGIN_USER}@<服务器IP>"
 echo "确认一切正常后执行：sudo ./${SCRIPT_NAME} --confirm （默认会收紧 AllowUsers 只留 ${LOGIN_USER}）"
 echo "如不想收紧 AllowUsers：sudo ./${SCRIPT_NAME} --confirm --keep-allowusers"
-echo "如果出现问题，可直接执行：sudo ./${SCRIPT_NAME} --rollback 一键回滚"
+echo "如需查看回滚/确认日志：sudo tail -n 50 ${ROLLBACK_LOG}"
+echo "如果出现问题，可直接执行：sudo ./${SCRIPT_NAME} --rollback （一键回滚）"
 echo "============================================"
