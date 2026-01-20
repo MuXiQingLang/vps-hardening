@@ -17,7 +17,6 @@ SSH_PORT_FILE="${STATE_DIR}/ssh_port"
 USER_FILE="${STATE_DIR}/login_user"
 EXTRA_PORTS_FILE="${STATE_DIR}/extra_ports"
 KEEP22_FILE="${STATE_DIR}/keep22"
-MERGED_ALLOWUSERS_FILE="${STATE_DIR}/allowusers_merged"
 
 # ---------- helpers ----------
 need_root() {
@@ -38,15 +37,23 @@ svc_reload_ssh() {
 }
 
 ensure_sshd_include_dir() {
-  # 保证 sshd 会读取 /etc/ssh/sshd_config.d/*.conf
-  if ! grep -qE '^\s*Include\s+/etc/ssh/sshd_config\.d/\*\.conf\s*$' "$MAIN_SSHD_CONFIG"; then
-    echo "[INFO] 检测到 $MAIN_SSHD_CONFIG 未启用 sshd_config.d，正在添加 Include..."
-    cp -a "$MAIN_SSHD_CONFIG" "$MAIN_SSHD_BACKUP"
-    {
-      echo ""
-      echo "Include /etc/ssh/sshd_config.d/*.conf"
-    } >> "$MAIN_SSHD_CONFIG"
+  # 最稳：把 Include 放到 sshd_config 顶部（避免放到 Match block 后面）
+  local include_line="Include /etc/ssh/sshd_config.d/*.conf"
+  if grep -qE '^\s*Include\s+/etc/ssh/sshd_config\.d/\*\.conf\s*$' "$MAIN_SSHD_CONFIG"; then
+    return 0
   fi
+
+  echo "[INFO] 检测到 $MAIN_SSHD_CONFIG 未启用 sshd_config.d，正在在文件顶部插入 Include..."
+  cp -a "$MAIN_SSHD_CONFIG" "$MAIN_SSHD_BACKUP"
+
+  local tmp
+  tmp="$(mktemp)"
+  {
+    echo "$include_line"
+    cat "$MAIN_SSHD_CONFIG"
+  } > "$tmp"
+  cat "$tmp" > "$MAIN_SSHD_CONFIG"
+  rm -f "$tmp"
 }
 
 write_rollback_script() {
@@ -69,7 +76,7 @@ if [[ -f "$HARDEN_FILE" ]]; then
   echo "[ROLLBACK] 已禁用 SSH 加固文件：$HARDEN_FILE"
 fi
 
-# 2) 恢复主 sshd_config（撤销脚本添加的 Include）
+# 2) 恢复主 sshd_config（撤销脚本插入的 Include）
 if [[ -f "$MAIN_SSHD_BACKUP" ]]; then
   cp -a "$MAIN_SSHD_BACKUP" "$MAIN_SSHD_CONFIG" || true
   echo "[ROLLBACK] 已恢复主 SSH 配置：$MAIN_SSHD_CONFIG"
@@ -171,12 +178,9 @@ valid_port_or_exit() {
 }
 
 compute_allowusers_merge() {
-  # 读取当前 sshd 生效的 allowusers（可能有多行），合并新用户
   local existing
   existing="$(
-    sshd -T 2>/dev/null | awk '
-      $1=="allowusers" {for(i=2;i<=NF;i++) print $i}
-    ' | sort -u
+    sshd -T 2>/dev/null | awk '$1=="allowusers"{for(i=2;i<=NF;i++) print $i}' | sort -u
   )"
   printf "%s\n%s\n" "$existing" "$1" | awk 'NF' | sort -u | tr '\n' ' ' | sed 's/[[:space:]]*$//'
 }
@@ -197,7 +201,7 @@ Port ${ssh_port}
 # 合并模式：避免把已有可登录用户踢出门
 AllowUsers ${allow_users}
 
-# 禁止 root 直接登录（如你需要暂时保留 root，请自行改回或用合并 allowusers 保持 root 账号可用）
+# 禁止 root 直接登录（如需暂时保留 root，请自行改回）
 PermitRootLogin no
 
 # 密码登录 + 禁用公钥
@@ -215,22 +219,28 @@ EOF
   chmod 644 "${HARDEN_FILE}"
 }
 
-assert_sshd_effective_port() {
+assert_sshd_listening_port() {
   local expected="$1"
-  local active
-  active="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2; exit}')"
-  if [[ "$active" != "$expected" ]]; then
-    echo "错误：sshd 实际生效端口是 ${active}，不是你设置的 ${expected}。"
-    echo "说明配置未生效或被覆盖。可执行：sudo ./${SCRIPT_NAME} --rollback"
-    exit 1
+
+  # 用 ss 作为最终真相：sshd 是否真的在监听 expected 端口
+  if ss -lntp 2>/dev/null | grep -qE "LISTEN .*:(\Q${expected}\E)\b.*users:\(\(\"sshd\""; then
+    return 0
   fi
+
+  echo "错误：未检测到 sshd 在监听端口 ${expected}。"
+  echo "调试信息（供你排查）："
+  echo "---- ss -lntp | grep sshd ----"
+  ss -lntp | grep sshd || true
+  echo "---- sshd -T | grep '^port ' ----"
+  sshd -T 2>/dev/null | awk '$1=="port"{print}' || true
+  echo "建议执行：sudo ./${SCRIPT_NAME} --rollback"
+  exit 1
 }
 
 # ---------- args ----------
 need_root
 
 if [[ "${1:-}" == "--confirm" ]]; then
-  # confirm: 取消保险丝 + 可选收紧 AllowUsers
   KEEP_ALLOWUSERS="no"
   if [[ "${2:-}" == "--keep-allowusers" ]]; then
     KEEP_ALLOWUSERS="yes"
@@ -240,14 +250,12 @@ if [[ "${1:-}" == "--confirm" ]]; then
 
   if [[ ! -f "$USER_FILE" ]]; then
     echo "没有找到上次运行的状态文件：$USER_FILE"
-    echo "如果你是手动改动过配置，可忽略；否则请先正常运行一次脚本。"
     exit 1
   fi
 
   LOGIN_USER="$(cat "$USER_FILE")"
   valid_username_or_exit "$LOGIN_USER"
 
-  # 只在用户确认后收紧 AllowUsers（默认收紧为仅该用户）
   if [[ "$KEEP_ALLOWUSERS" != "yes" ]]; then
     echo "[CONFIRM] 正在收紧 AllowUsers -> 仅允许：${LOGIN_USER}"
     ensure_sshd_include_dir
@@ -288,7 +296,6 @@ KEEP_PORT22="${KEEP_PORT22:-yes}"
 
 read -rp "请输入需要额外放行的 TCP 端口（逗号分隔，如 80,443,2334；留空=不额外放行）: " EXTRA_PORTS
 
-# 保存状态（供 --confirm 使用）
 echo "$LOGIN_USER" > "$USER_FILE"
 echo "$SSH_PORT" > "$SSH_PORT_FILE"
 echo "${EXTRA_PORTS:-}" > "$EXTRA_PORTS_FILE"
@@ -316,7 +323,6 @@ fi
 
 echo "[2/6] 写入 SSH 加固配置（密码登录，禁用公钥）..."
 MERGED_ALLOW_USERS="$(compute_allowusers_merge "$LOGIN_USER")"
-echo "$MERGED_ALLOW_USERS" > "$MERGED_ALLOWUSERS_FILE"
 apply_harden_file "$SSH_PORT" "$MERGED_ALLOW_USERS"
 
 echo "检查 sshd 配置语法..."
@@ -353,7 +359,6 @@ ufw status verbose || true
 
 echo "[4/6] 安装并配置 Fail2Ban..."
 apt-get install -y fail2ban
-
 cat > "/etc/fail2ban/jail.d/sshd.local" <<EOF
 [sshd]
 enabled = true
@@ -362,15 +367,14 @@ maxretry = 5
 findtime = 10m
 bantime  = 1h
 EOF
-
 systemctl enable --now fail2ban
 systemctl restart fail2ban
 
 echo "[5/6] 重载/重启 SSH 服务..."
 svc_reload_ssh
 
-echo "[5.5/6] 校验 sshd 实际生效端口..."
-assert_sshd_effective_port "$SSH_PORT"
+echo "[5.5/6] 校验 sshd 是否真的监听新端口..."
+assert_sshd_listening_port "$SSH_PORT"
 
 echo "[6/6] 本机检查 SSH 监听端口..."
 ss -lntp | grep -E ":(22|${SSH_PORT})\b" || true
@@ -386,7 +390,7 @@ echo "UFW 放行 22: $([[ "${KEEP_PORT22}" == "yes" ]] && echo '暂时保留(建
 echo
 echo "重要：当前已设置 10 分钟自动回滚保险丝。"
 echo "请立刻新开终端测试：ssh -p ${SSH_PORT} ${LOGIN_USER}@<服务器IP>"
-echo "确认一切正常后执行：sudo ./${SCRIPT_NAME} --confirm 取消保险丝（默认会收紧 AllowUsers 只留 ${LOGIN_USER}）"
+echo "确认一切正常后执行：sudo ./${SCRIPT_NAME} --confirm （默认会收紧 AllowUsers 只留 ${LOGIN_USER}）"
 echo "如不想收紧 AllowUsers：sudo ./${SCRIPT_NAME} --confirm --keep-allowusers"
 echo "如果出现问题，可直接执行：sudo ./${SCRIPT_NAME} --rollback 一键回滚"
 echo "============================================"
