@@ -22,7 +22,14 @@ KEEP22_FILE="${STATE_DIR}/keep22"
 KEYS_ENABLED_FILE="${STATE_DIR}/keys_enabled"
 KEYS_FILE="${STATE_DIR}/keys"  # 记录本次输入的公钥（便于审计/排查）
 
-# ---------- helpers ----------
+# ---------------- logging ----------------
+log_init() {
+  touch "$ROLLBACK_LOG" 2>/dev/null || true
+  chmod 600 "$ROLLBACK_LOG" 2>/dev/null || true
+}
+logi() { log_init; echo "[$1] $(date -Is) $2" >> "$ROLLBACK_LOG" 2>/dev/null || true; }
+
+# ---------------- helpers ----------------
 need_root() {
   if [ "${EUID:-$(id -u)}" -ne 0 ]; then
     echo "请使用 root 权限运行：sudo ./${SCRIPT_NAME} [--confirm [--keep-allowusers] [--disable-password] | --rollback]"
@@ -48,6 +55,7 @@ ensure_sshd_include_dir() {
 
   echo "[INFO] 检测到 $MAIN_SSHD_CONFIG 未启用 sshd_config.d，正在在文件顶部插入 Include..."
   cp -a "$MAIN_SSHD_CONFIG" "$MAIN_SSHD_BACKUP"
+  logi "INFO" "insert Include into $MAIN_SSHD_CONFIG, backup=$MAIN_SSHD_BACKUP"
 
   local tmp
   tmp="$(mktemp)"
@@ -66,6 +74,7 @@ neutralize_cloudimg_passwordauth() {
     echo "[INFO] 检测到 cloudimg 默认禁用密码登录：$f，正在注释该行以避免覆盖..."
     cp -a "$f" "${f}.bak.$(date +%F-%H%M%S)"
     sed -i 's/^\s*PasswordAuthentication\s\+no\b/# PasswordAuthentication no (disabled by hardening script)/' "$f"
+    logi "INFO" "neutralized cloudimg PasswordAuthentication no in $f"
   fi
 }
 
@@ -138,7 +147,7 @@ cancel_rollback_fuse() {
       systemctl stop "$unit" 2>/dev/null || true
       systemctl reset-failed "$unit" 2>/dev/null || true
       echo "已取消自动回滚保险丝（unit=${unit}）。"
-      echo "[CONFIRM] $(date -Is) canceled unit=${unit} user=$(id -un) pid=$$" >> "$ROLLBACK_LOG" 2>/dev/null || true
+      logi "CONFIRM" "canceled unit=${unit} user=$(id -un) pid=$$"
     fi
     rm -f "$ROLLBACK_UNIT_FILE" || true
   else
@@ -154,12 +163,14 @@ set_rollback_fuse() {
     iptables-save > "$UFW_RULES_FILE" || true
   fi
 
+  # 先取消历史 unit，避免同机重复运行造成混乱
   cancel_rollback_fuse || true
 
   local unit="secure-setup-rollback-$(date +%s)"
   echo "$unit" > "$ROLLBACK_UNIT_FILE"
   systemd-run --quiet --unit "$unit" --on-active="${seconds}s" /usr/bin/env bash "$ROLLBACK_SCRIPT"
 
+  logi "INFO" "armed rollback fuse unit=${unit} seconds=${seconds} user=$(id -un) pid=$$"
   echo "已设置自动回滚保险丝：${seconds} 秒后会自动回滚。"
   echo "确认一切正常后运行：sudo ./${SCRIPT_NAME} --confirm 取消保险丝。"
 }
@@ -167,6 +178,7 @@ set_rollback_fuse() {
 do_rollback_now() {
   write_rollback_script
   echo "即将执行一键回滚..."
+  logi "INFO" "manual rollback invoked user=$(id -un) pid=$$"
   bash "$ROLLBACK_SCRIPT"
 }
 
@@ -203,6 +215,7 @@ compute_allowusers_merge() {
 }
 
 apply_harden_file() {
+  # 仅主流程使用：生成 hardening 文件；confirm 不再调用它（避免误改 Port）
   local ssh_port="$1"
   local allow_users="$2"
   local password_auth="$3"   # yes/no
@@ -220,6 +233,7 @@ Port ${ssh_port}
 # 合并模式：避免把已有可登录用户踢出门
 AllowUsers ${allow_users}
 
+# 确认 muxi 可登录 + 可 sudo 后再长期保持
 PermitRootLogin no
 
 PasswordAuthentication ${password_auth}
@@ -234,6 +248,7 @@ LoginGraceTime 30
 EOF
 
   chmod 644 "${HARDEN_FILE}"
+  logi "INFO" "wrote harden file $HARDEN_FILE port=$ssh_port allowusers='$allow_users' password=$password_auth pubkey=$pubkey_auth kbdint=$kbdint_auth"
 }
 
 assert_sshd_listening_port() {
@@ -259,6 +274,7 @@ grant_sudo_privilege() {
   echo "${u} ALL=(ALL:ALL) ALL" > "$f"
   chmod 440 "$f"
   visudo -cf /etc/sudoers
+  logi "INFO" "granted sudo to user=$u via group sudo and /etc/sudoers.d/90-$u"
 }
 
 read_ssh_keys_multiline() {
@@ -305,9 +321,57 @@ install_authorized_keys() {
   done < "${keys_file}"
 
   echo "[KEYS] 已写入：${auth_keys}"
+  logi "INFO" "authorized_keys updated for user=$login_user file=$auth_keys"
 }
 
-# ---------- args ----------
+# confirm helper: only edit necessary lines, NEVER touch Port
+confirm_edit_allowusers() {
+  local allow_users_final="$1"
+
+  if [[ ! -f "$HARDEN_FILE" ]]; then
+    echo "错误：$HARDEN_FILE 不存在。为避免误操作（例如端口被改回 22），confirm 已停止。"
+    exit 1
+  fi
+
+  if grep -qE '^\s*AllowUsers\s+' "$HARDEN_FILE"; then
+    sed -i -E "s/^\s*AllowUsers\s+.*/AllowUsers ${allow_users_final}/" "$HARDEN_FILE"
+  else
+    printf "\nAllowUsers %s\n" "$allow_users_final" >> "$HARDEN_FILE"
+  fi
+
+  logi "CONFIRM" "set AllowUsers='$allow_users_final' (no port change)"
+}
+
+confirm_disable_password_only() {
+  # only adjust auth settings; NEVER touch Port
+  if [[ ! -f "$HARDEN_FILE" ]]; then
+    echo "错误：$HARDEN_FILE 不存在，无法安全关闭密码登录。"
+    exit 1
+  fi
+
+  # ensure PubkeyAuthentication yes
+  if grep -qE '^\s*PubkeyAuthentication\s+' "$HARDEN_FILE"; then
+    sed -i -E 's/^\s*PubkeyAuthentication\s+.*/PubkeyAuthentication yes/' "$HARDEN_FILE"
+  else
+    echo "PubkeyAuthentication yes" >> "$HARDEN_FILE"
+  fi
+
+  if grep -qE '^\s*PasswordAuthentication\s+' "$HARDEN_FILE"; then
+    sed -i -E 's/^\s*PasswordAuthentication\s+.*/PasswordAuthentication no/' "$HARDEN_FILE"
+  else
+    echo "PasswordAuthentication no" >> "$HARDEN_FILE"
+  fi
+
+  if grep -qE '^\s*KbdInteractiveAuthentication\s+' "$HARDEN_FILE"; then
+    sed -i -E 's/^\s*KbdInteractiveAuthentication\s+.*/KbdInteractiveAuthentication no/' "$HARDEN_FILE"
+  else
+    echo "KbdInteractiveAuthentication no" >> "$HARDEN_FILE"
+  fi
+
+  logi "CONFIRM" "disabled password auth (no port change)"
+}
+
+# ---------------- args ----------------
 need_root
 
 if [[ "${1:-}" == "--confirm" ]]; then
@@ -323,18 +387,20 @@ if [[ "${1:-}" == "--confirm" ]]; then
 
   cancel_rollback_fuse
 
-  [[ -f "$USER_FILE" ]] || { echo "没有找到上次运行的状态文件：$USER_FILE"; exit 1; }
+  [[ -s "$USER_FILE" ]] || { echo "没有找到上次运行的状态文件：$USER_FILE"; exit 1; }
   LOGIN_USER="$(cat "$USER_FILE")"
   valid_username_or_exit "$LOGIN_USER"
+
+  # confirm 不应该依赖端口状态来改配置，但我们仍检查状态是否存在用于提示
+  if [[ ! -s "$SSH_PORT_FILE" ]]; then
+    echo "警告：缺少端口状态文件 $SSH_PORT_FILE。confirm 将不会修改端口，仅处理 AllowUsers/认证项。"
+    logi "WARN" "missing $SSH_PORT_FILE during confirm"
+  fi
 
   ensure_sshd_include_dir
   neutralize_cloudimg_passwordauth
 
-  local_port="$(cat "$SSH_PORT_FILE" 2>/dev/null || echo 22)"
-
-  keys_enabled="no"
-  [[ -f "$KEYS_ENABLED_FILE" ]] && keys_enabled="$(cat "$KEYS_ENABLED_FILE" || echo no)"
-
+  # allowusers: tighten or keep merged
   if [[ "$KEEP_ALLOWUSERS" != "yes" ]]; then
     allow_users_final="${LOGIN_USER}"
     echo "[CONFIRM] 收紧 AllowUsers -> 仅允许：${allow_users_final}"
@@ -343,9 +409,14 @@ if [[ "${1:-}" == "--confirm" ]]; then
     echo "[CONFIRM] 保持 AllowUsers 合并模式：${allow_users_final}"
   fi
 
+  confirm_edit_allowusers "$allow_users_final"
+
+  # disable password option: requires keys enabled and authorized_keys non-empty
   if [[ "$DISABLE_PASSWORD" == "yes" ]]; then
+    keys_enabled="no"
+    [[ -f "$KEYS_ENABLED_FILE" ]] && keys_enabled="$(cat "$KEYS_ENABLED_FILE" || echo no)"
     if [[ "$keys_enabled" != "yes" ]]; then
-      echo "错误：你要求 --disable-password，但当前未启用公钥登录（为避免锁门，拒绝执行）。"
+      echo "错误：你要求 --disable-password，但你上次运行时未启用公钥登录（为避免锁门，拒绝执行）。"
       exit 1
     fi
     user_home="$(eval echo "~${LOGIN_USER}")"
@@ -355,17 +426,12 @@ if [[ "${1:-}" == "--confirm" ]]; then
       exit 1
     fi
     echo "[CONFIRM] 关闭密码登录，仅保留公钥登录。"
-    apply_harden_file "$local_port" "$allow_users_final" "no" "yes" "no"
-  else
-    if [[ "$keys_enabled" == "yes" ]]; then
-      apply_harden_file "$local_port" "$allow_users_final" "yes" "yes" "yes"
-    else
-      apply_harden_file "$local_port" "$allow_users_final" "yes" "no" "yes"
-    fi
+    confirm_disable_password_only
   fi
 
   sshd -t
   svc_reload_ssh
+
   echo "[CONFIRM] 完成。"
   exit 0
 fi
@@ -375,7 +441,7 @@ if [[ "${1:-}" == "--rollback" ]]; then
   exit 0
 fi
 
-# ---------- main ----------
+# ---------------- main ----------------
 echo "============================================"
 echo "   Linux 服务器更稳加固脚本（上传公钥版）"
 echo " (Create User + SSH Port + UFW + Fail2Ban)"
@@ -404,6 +470,8 @@ echo "$SSH_PORT" > "$SSH_PORT_FILE"
 echo "${EXTRA_PORTS:-}" > "$EXTRA_PORTS_FILE"
 echo "$KEEP_PORT22" > "$KEEP22_FILE"
 echo "$ENABLE_KEYS" > "$KEYS_ENABLED_FILE"
+
+logi "INFO" "run start user=$LOGIN_USER port=$SSH_PORT keep22=$KEEP_PORT22 extra_ports='${EXTRA_PORTS:-}' enable_keys=$ENABLE_KEYS"
 
 echo
 echo "开始处理..."
@@ -442,6 +510,7 @@ if [[ "$ENABLE_KEYS" == "yes" ]]; then
     echo "错误：你选择启用公钥登录，但没有输入任何公钥。"
     echo "为避免你锁门，当前会继续走“仅密码”策略。"
     echo "no" > "$KEYS_ENABLED_FILE"
+    logi "WARN" "enable_keys requested but no keys provided; fallback to password only"
   fi
   rm -f "$tmp_keys"
 fi
@@ -500,6 +569,7 @@ bantime  = 1h
 EOF
 systemctl enable --now fail2ban
 systemctl restart fail2ban
+logi "INFO" "fail2ban configured for sshd port=$SSH_PORT"
 
 echo "[5/6] 重载/重启 SSH 服务..."
 svc_reload_ssh
