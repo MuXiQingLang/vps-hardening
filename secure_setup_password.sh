@@ -222,20 +222,21 @@ EOF
 assert_sshd_listening_port() {
   local expected="$1"
 
-  # 用 ss 作为最终真相：sshd 是否真的在监听 expected 端口
-  if ss -lntp 2>/dev/null | grep -qE "LISTEN .*:(\Q${expected}\E)\b.*users:\(\(\"sshd\""; then
+  # 最可靠：只要看到 ":expected" 且进程是 sshd 就算通过
+  if ss -lntp 2>/dev/null | awk -v p=":$expected" '
+      $1=="LISTEN" && index($4,p)>0 && $0 ~ /users:\(\("sshd"/ { ok=1 }
+      END { exit(ok?0:1) }
+    '; then
     return 0
   fi
 
   echo "错误：未检测到 sshd 在监听端口 ${expected}。"
-  echo "调试信息（供你排查）："
-  echo "---- ss -lntp | grep sshd ----"
+  echo "调试信息："
   ss -lntp | grep sshd || true
-  echo "---- sshd -T | grep '^port ' ----"
   sshd -T 2>/dev/null | awk '$1=="port"{print}' || true
-  echo "建议执行：sudo ./${SCRIPT_NAME} --rollback"
   exit 1
 }
+
 
 # ---------- args ----------
 need_root
