@@ -19,10 +19,13 @@ USER_FILE="${STATE_DIR}/login_user"
 EXTRA_PORTS_FILE="${STATE_DIR}/extra_ports"
 KEEP22_FILE="${STATE_DIR}/keep22"
 
+KEYS_ENABLED_FILE="${STATE_DIR}/keys_enabled"
+KEYS_FILE="${STATE_DIR}/keys"  # 记录本次输入的公钥（便于审计/排查）
+
 # ---------- helpers ----------
 need_root() {
   if [ "${EUID:-$(id -u)}" -ne 0 ]; then
-    echo "请使用 root 权限运行：sudo ./${SCRIPT_NAME} [--confirm [--keep-allowusers] | --rollback]"
+    echo "请使用 root 权限运行：sudo ./${SCRIPT_NAME} [--confirm [--keep-allowusers] [--disable-password] | --rollback]"
     exit 1
   fi
 }
@@ -38,7 +41,6 @@ svc_reload_ssh() {
 }
 
 ensure_sshd_include_dir() {
-  # 最稳：把 Include 放到 sshd_config 顶部（避免放到 Match block 后面）
   local include_line="Include /etc/ssh/sshd_config.d/*.conf"
   if grep -qE '^\s*Include\s+/etc/ssh/sshd_config\.d/\*\.conf\s*$' "$MAIN_SSHD_CONFIG"; then
     return 0
@@ -57,6 +59,16 @@ ensure_sshd_include_dir() {
   rm -f "$tmp"
 }
 
+neutralize_cloudimg_passwordauth() {
+  # 云镜像常见：60-cloudimg-settings.conf 写死 PasswordAuthentication no，导致你以为开了密码其实最终是关的
+  local f="/etc/ssh/sshd_config.d/60-cloudimg-settings.conf"
+  if [[ -f "$f" ]] && grep -qE '^\s*PasswordAuthentication\s+no\b' "$f"; then
+    echo "[INFO] 检测到 cloudimg 默认禁用密码登录：$f，正在注释该行以避免覆盖..."
+    cp -a "$f" "${f}.bak.$(date +%F-%H%M%S)"
+    sed -i 's/^\s*PasswordAuthentication\s\+no\b/# PasswordAuthentication no (disabled by hardening script)/' "$f"
+  fi
+}
+
 write_rollback_script() {
   cat > "$ROLLBACK_SCRIPT" <<'EOF'
 #!/usr/bin/env bash
@@ -69,25 +81,20 @@ MAIN_SSHD_CONFIG="/etc/ssh/sshd_config"
 MAIN_SSHD_BACKUP="${STATE_DIR}/sshd_config.before"
 ROLLBACK_LOG="/var/log/secure-setup.log"
 
-# 写回滚日志（用于确认什么时候触发、谁触发）
 touch "$ROLLBACK_LOG" 2>/dev/null || true
 chmod 600 "$ROLLBACK_LOG" 2>/dev/null || true
 echo "[ROLLBACK] $(date -Is) triggered user=$(id -un) pid=$$ ppid=$PPID" >> "$ROLLBACK_LOG"
-
-echo "[ROLLBACK] 开始回滚..."
 echo "[ROLLBACK] start" >> "$ROLLBACK_LOG"
 
 # 1) 禁用 SSH 加固文件（搬到 /root 留档）
 if [[ -f "$HARDEN_FILE" ]]; then
   mv "$HARDEN_FILE" "/root/99-hardening.conf.disabled.rollback.$(date +%F-%H%M%S)" || true
-  echo "[ROLLBACK] 已禁用 SSH 加固文件：$HARDEN_FILE"
   echo "[ROLLBACK] disabled $HARDEN_FILE" >> "$ROLLBACK_LOG"
 fi
 
 # 2) 恢复主 sshd_config（撤销脚本插入的 Include）
 if [[ -f "$MAIN_SSHD_BACKUP" ]]; then
   cp -a "$MAIN_SSHD_BACKUP" "$MAIN_SSHD_CONFIG" || true
-  echo "[ROLLBACK] 已恢复主 SSH 配置：$MAIN_SSHD_CONFIG"
   echo "[ROLLBACK] restored $MAIN_SSHD_CONFIG from backup" >> "$ROLLBACK_LOG"
 fi
 
@@ -95,11 +102,9 @@ fi
 if command -v ufw >/dev/null 2>&1; then
   if [[ -s "$UFW_RULES_FILE" ]] && command -v iptables-restore >/dev/null 2>&1; then
     iptables-restore < "$UFW_RULES_FILE" || true
-    echo "[ROLLBACK] 已通过 iptables-restore 还原防火墙规则（best-effort）"
     echo "[ROLLBACK] iptables-restore applied" >> "$ROLLBACK_LOG"
   else
     ufw disable || true
-    echo "[ROLLBACK] 已执行：ufw disable"
     echo "[ROLLBACK] ufw disabled" >> "$ROLLBACK_LOG"
   fi
 fi
@@ -112,63 +117,51 @@ elif systemctl list-unit-files | grep -q '^sshd\.service'; then
 else
   systemctl restart ssh || systemctl restart sshd || true
 fi
-echo "[ROLLBACK] SSH 服务已重启（best-effort）"
 echo "[ROLLBACK] ssh restarted" >> "$ROLLBACK_LOG"
 
 # 5) 停止 fail2ban（避免误伤）
 if systemctl list-unit-files | grep -q '^fail2ban\.service'; then
   systemctl stop fail2ban || true
-  echo "[ROLLBACK] fail2ban 已停止（best-effort）"
   echo "[ROLLBACK] fail2ban stopped" >> "$ROLLBACK_LOG"
 fi
 
-echo "[ROLLBACK] 回滚完成。"
 echo "[ROLLBACK] done" >> "$ROLLBACK_LOG"
 EOF
   chmod +x "$ROLLBACK_SCRIPT"
-}
-
-set_rollback_fuse() {
-  local seconds="${1:-600}"
-  write_rollback_script
-
-  # 保存当前 iptables 规则用于 best-effort restore（没有也不致命）
-  if command -v iptables-save >/dev/null 2>&1; then
-    iptables-save > "$UFW_RULES_FILE" || true
-  fi
-
-  # 先取消旧保险丝（避免堆叠）
-  cancel_rollback_fuse || true
-
-  # 每次生成一个唯一 unit 名称，避免重复覆盖/混淆
-  local unit="secure-setup-rollback-$(date +%s)"
-  echo "$unit" > "$ROLLBACK_UNIT_FILE"
-
-  # 用 systemd-run 做一次性定时任务：seconds 后执行回滚脚本
-  systemd-run --quiet --unit "$unit" --on-active="${seconds}s" /usr/bin/env bash "$ROLLBACK_SCRIPT"
-
-  echo "已设置自动回滚保险丝：${seconds} 秒后会自动回滚。"
-  echo "确认一切正常后运行：sudo ./${SCRIPT_NAME} --confirm 取消保险丝。"
 }
 
 cancel_rollback_fuse() {
   if [[ -f "$ROLLBACK_UNIT_FILE" ]]; then
     local unit
     unit="$(cat "$ROLLBACK_UNIT_FILE" 2>/dev/null || true)"
-
     if [[ -n "${unit:-}" ]]; then
       systemctl stop "$unit" 2>/dev/null || true
       systemctl reset-failed "$unit" 2>/dev/null || true
       echo "已取消自动回滚保险丝（unit=${unit}）。"
       echo "[CONFIRM] $(date -Is) canceled unit=${unit} user=$(id -un) pid=$$" >> "$ROLLBACK_LOG" 2>/dev/null || true
-    else
-      echo "保险丝 unit 文件为空，忽略。"
     fi
-
     rm -f "$ROLLBACK_UNIT_FILE" || true
   else
     echo "没有检测到保险丝（无需取消）。"
   fi
+}
+
+set_rollback_fuse() {
+  local seconds="${1:-600}"
+  write_rollback_script
+
+  if command -v iptables-save >/dev/null 2>&1; then
+    iptables-save > "$UFW_RULES_FILE" || true
+  fi
+
+  cancel_rollback_fuse || true
+
+  local unit="secure-setup-rollback-$(date +%s)"
+  echo "$unit" > "$ROLLBACK_UNIT_FILE"
+  systemd-run --quiet --unit "$unit" --on-active="${seconds}s" /usr/bin/env bash "$ROLLBACK_SCRIPT"
+
+  echo "已设置自动回滚保险丝：${seconds} 秒后会自动回滚。"
+  echo "确认一切正常后运行：sudo ./${SCRIPT_NAME} --confirm 取消保险丝。"
 }
 
 do_rollback_now() {
@@ -212,9 +205,11 @@ compute_allowusers_merge() {
 apply_harden_file() {
   local ssh_port="$1"
   local allow_users="$2"
+  local password_auth="$3"   # yes/no
+  local pubkey_auth="$4"     # yes/no
+  local kbdint_auth="$5"     # yes/no
 
   mkdir -p /etc/ssh/sshd_config.d
-
   if [[ -f "${HARDEN_FILE}" ]]; then
     cp -a "${HARDEN_FILE}" "${HARDEN_FILE}.bak.$(date +%F-%H%M%S)"
   fi
@@ -225,16 +220,14 @@ Port ${ssh_port}
 # 合并模式：避免把已有可登录用户踢出门
 AllowUsers ${allow_users}
 
-# 禁止 root 直接登录（确认 muxi 可登录 + 可 sudo 后再长期保持）
 PermitRootLogin no
 
-# 密码登录 + 禁用公钥
-PasswordAuthentication yes
-PubkeyAuthentication no
-KbdInteractiveAuthentication yes
+PasswordAuthentication ${password_auth}
+PubkeyAuthentication ${pubkey_auth}
+KbdInteractiveAuthentication ${kbdint_auth}
 ChallengeResponseAuthentication no
+UsePAM yes
 
-# 基础加固
 X11Forwarding no
 MaxAuthTries 4
 LoginGraceTime 30
@@ -245,8 +238,6 @@ EOF
 
 assert_sshd_listening_port() {
   local expected="$1"
-
-  # 朴素可靠：只要看到 ":expected" 且进程是 sshd 就算通过
   if ss -lntp 2>/dev/null | awk -v p=":$expected" '
       $1=="LISTEN" && index($4,p)>0 && $0 ~ /users:\(\("sshd"/ { ok=1 }
       END { exit(ok?0:1) }
@@ -255,7 +246,6 @@ assert_sshd_listening_port() {
   fi
 
   echo "错误：未检测到 sshd 在监听端口 ${expected}。"
-  echo "调试信息："
   ss -lntp | grep sshd || true
   sshd -T 2>/dev/null | awk '$1=="port"{print}' || true
   exit 1
@@ -263,20 +253,58 @@ assert_sshd_listening_port() {
 
 grant_sudo_privilege() {
   local u="$1"
-  echo "[1.5/6] 赋予 ${u} sudo 权限（最高权限，需输入密码）..."
-
-  # 1) 加入 sudo 组（Ubuntu/Debian 常规做法）
+  echo "[1.5/6] 赋予 ${u} sudo 权限（需要密码，不是免密）..."
   usermod -aG sudo "${u}" || true
-
-  # 2) 更稳：写 sudoers.d（避免系统未启用 %sudo 导致加组也没用）
   local f="/etc/sudoers.d/90-${u}"
   echo "${u} ALL=(ALL:ALL) ALL" > "$f"
   chmod 440 "$f"
-
-  # 3) 校验 sudoers 语法
   visudo -cf /etc/sudoers
+}
 
-  echo "已为 ${u} 配置 sudo 权限（需要密码，不是免密）。"
+read_ssh_keys_multiline() {
+  local out_file="$1"
+  : > "$out_file"
+
+  echo
+  echo "现在输入要授权给该用户的 SSH 公钥（可多行粘贴）。"
+  echo "输入完成后，单独输入一行 END 结束："
+
+  while IFS= read -r line; do
+    [[ "${line}" == "END" ]] && break
+    [[ -z "${line// }" ]] && continue
+    echo "${line}" >> "$out_file"
+  done
+
+  [[ -s "$out_file" ]]
+}
+
+install_authorized_keys() {
+  local login_user="$1"
+  local keys_file="$2"
+
+  local user_home
+  user_home="$(eval echo "~${login_user}")"
+  local ssh_dir="${user_home}/.ssh"
+  local auth_keys="${ssh_dir}/authorized_keys"
+
+  echo "[KEYS] 写入 ${login_user} 的 authorized_keys..."
+  install -d -m 700 -o "${login_user}" -g "${login_user}" "${ssh_dir}"
+  touch "${auth_keys}"
+  chown "${login_user}:${login_user}" "${auth_keys}"
+  chmod 600 "${auth_keys}"
+
+  while IFS= read -r k; do
+    [[ -z "${k// }" ]] && continue
+    if [[ "${k}" =~ ^ssh-(rsa|ed25519|ecdsa)[[:space:]]+ ]]; then
+      if ! grep -Fqx "${k}" "${auth_keys}"; then
+        echo "${k}" >> "${auth_keys}"
+      fi
+    else
+      echo "[KEYS] 警告：跳过一行不符合 ssh key 形式的内容：${k}"
+    fi
+  done < "${keys_file}"
+
+  echo "[KEYS] 已写入：${auth_keys}"
 }
 
 # ---------- args ----------
@@ -284,30 +312,60 @@ need_root
 
 if [[ "${1:-}" == "--confirm" ]]; then
   KEEP_ALLOWUSERS="no"
-  if [[ "${2:-}" == "--keep-allowusers" ]]; then
-    KEEP_ALLOWUSERS="yes"
-  fi
+  DISABLE_PASSWORD="no"
+
+  for a in "${@:2}"; do
+    case "$a" in
+      --keep-allowusers) KEEP_ALLOWUSERS="yes" ;;
+      --disable-password) DISABLE_PASSWORD="yes" ;;
+    esac
+  done
 
   cancel_rollback_fuse
 
-  if [[ ! -f "$USER_FILE" ]]; then
-    echo "没有找到上次运行的状态文件：$USER_FILE"
-    exit 1
-  fi
-
+  [[ -f "$USER_FILE" ]] || { echo "没有找到上次运行的状态文件：$USER_FILE"; exit 1; }
   LOGIN_USER="$(cat "$USER_FILE")"
   valid_username_or_exit "$LOGIN_USER"
 
+  ensure_sshd_include_dir
+  neutralize_cloudimg_passwordauth
+
+  local_port="$(cat "$SSH_PORT_FILE" 2>/dev/null || echo 22)"
+
+  keys_enabled="no"
+  [[ -f "$KEYS_ENABLED_FILE" ]] && keys_enabled="$(cat "$KEYS_ENABLED_FILE" || echo no)"
+
   if [[ "$KEEP_ALLOWUSERS" != "yes" ]]; then
-    echo "[CONFIRM] 正在收紧 AllowUsers -> 仅允许：${LOGIN_USER}"
-    ensure_sshd_include_dir
-    apply_harden_file "$(cat "$SSH_PORT_FILE" 2>/dev/null || echo 22)" "${LOGIN_USER}"
-    sshd -t
-    svc_reload_ssh
+    allow_users_final="${LOGIN_USER}"
+    echo "[CONFIRM] 收紧 AllowUsers -> 仅允许：${allow_users_final}"
   else
-    echo "[CONFIRM] 保持 AllowUsers 合并模式不变（未收紧）。"
+    allow_users_final="$(compute_allowusers_merge "$LOGIN_USER")"
+    echo "[CONFIRM] 保持 AllowUsers 合并模式：${allow_users_final}"
   fi
 
+  if [[ "$DISABLE_PASSWORD" == "yes" ]]; then
+    if [[ "$keys_enabled" != "yes" ]]; then
+      echo "错误：你要求 --disable-password，但当前未启用公钥登录（为避免锁门，拒绝执行）。"
+      exit 1
+    fi
+    user_home="$(eval echo "~${LOGIN_USER}")"
+    auth_keys="${user_home}/.ssh/authorized_keys"
+    if [[ ! -s "$auth_keys" ]]; then
+      echo "错误：检测到 ${auth_keys} 为空或不存在，无法安全关闭密码登录。"
+      exit 1
+    fi
+    echo "[CONFIRM] 关闭密码登录，仅保留公钥登录。"
+    apply_harden_file "$local_port" "$allow_users_final" "no" "yes" "no"
+  else
+    if [[ "$keys_enabled" == "yes" ]]; then
+      apply_harden_file "$local_port" "$allow_users_final" "yes" "yes" "yes"
+    else
+      apply_harden_file "$local_port" "$allow_users_final" "yes" "no" "yes"
+    fi
+  fi
+
+  sshd -t
+  svc_reload_ssh
   echo "[CONFIRM] 完成。"
   exit 0
 fi
@@ -319,7 +377,7 @@ fi
 
 # ---------- main ----------
 echo "============================================"
-echo "   Linux 服务器更稳加固脚本（密码登录版）"
+echo "   Linux 服务器更稳加固脚本（上传公钥版）"
 echo " (Create User + SSH Port + UFW + Fail2Ban)"
 echo " + systemd 保险丝 + 回滚日志 + 一键回滚"
 echo "============================================"
@@ -338,10 +396,14 @@ KEEP_PORT22="${KEEP_PORT22:-yes}"
 
 read -rp "请输入需要额外放行的 TCP 端口（逗号分隔，如 80,443,2334；留空=不额外放行）: " EXTRA_PORTS
 
+read -rp "是否启用公钥登录？(建议 yes) [yes/no]: " ENABLE_KEYS
+ENABLE_KEYS="${ENABLE_KEYS:-yes}"
+
 echo "$LOGIN_USER" > "$USER_FILE"
 echo "$SSH_PORT" > "$SSH_PORT_FILE"
 echo "${EXTRA_PORTS:-}" > "$EXTRA_PORTS_FILE"
 echo "$KEEP_PORT22" > "$KEEP22_FILE"
+echo "$ENABLE_KEYS" > "$KEYS_ENABLED_FILE"
 
 echo
 echo "开始处理..."
@@ -350,6 +412,9 @@ set_rollback_fuse 600
 
 echo "[0/6] 确保 sshd_config.d 生效..."
 ensure_sshd_include_dir
+
+echo "[0.5/6] 处理 cloudimg 默认配置冲突（如有）..."
+neutralize_cloudimg_passwordauth
 
 echo "[1/6] 创建/确认用户并设置密码..."
 if ! id "${LOGIN_USER}" &>/dev/null; then
@@ -365,9 +430,31 @@ fi
 
 grant_sudo_privilege "${LOGIN_USER}"
 
-echo "[2/6] 写入 SSH 加固配置（密码登录，禁用公钥）..."
+# ---- keys ----
+: > "$KEYS_FILE" || true
+
+if [[ "$ENABLE_KEYS" == "yes" ]]; then
+  tmp_keys="$(mktemp)"
+  if read_ssh_keys_multiline "$tmp_keys"; then
+    cp -a "$tmp_keys" "$KEYS_FILE"
+    install_authorized_keys "$LOGIN_USER" "$tmp_keys"
+  else
+    echo "错误：你选择启用公钥登录，但没有输入任何公钥。"
+    echo "为避免你锁门，当前会继续走“仅密码”策略。"
+    echo "no" > "$KEYS_ENABLED_FILE"
+  fi
+  rm -f "$tmp_keys"
+fi
+
+echo "[2/6] 写入 SSH 加固配置..."
 MERGED_ALLOW_USERS="$(compute_allowusers_merge "$LOGIN_USER")"
-apply_harden_file "$SSH_PORT" "$MERGED_ALLOW_USERS"
+
+# 默认：密码开启（救援用） + 公钥按选择开启；想只留公钥用 --confirm --disable-password
+if [[ "$(cat "$KEYS_ENABLED_FILE")" == "yes" ]]; then
+  apply_harden_file "$SSH_PORT" "$MERGED_ALLOW_USERS" "yes" "yes" "yes"
+else
+  apply_harden_file "$SSH_PORT" "$MERGED_ALLOW_USERS" "yes" "no" "yes"
+fi
 
 echo "检查 sshd 配置语法..."
 sshd -t
@@ -380,7 +467,7 @@ ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
 
-ufw allow "${SSH_PORT}/tcp" comment "SSH new port (password login)"
+ufw allow "${SSH_PORT}/tcp" comment "SSH new port"
 if [[ "${KEEP_PORT22}" == "yes" ]]; then
   ufw allow 22/tcp comment "SSH port 22 (temporary)"
 fi
@@ -427,15 +514,23 @@ echo "============================================"
 echo "✅ 完成！"
 echo "登录用户: ${LOGIN_USER}"
 echo "新的 SSH 端口: ${SSH_PORT}"
-echo "登录方式: 仅密码（已禁用公钥登录）"
+echo "登录方式: 密码 + $([[ "$(cat "$KEYS_ENABLED_FILE")" == "yes" ]] && echo '公钥(已启用)' || echo '公钥(未启用)')"
 echo "AllowUsers(当前合并模式): ${MERGED_ALLOW_USERS}"
 echo "额外放行端口: ${EXTRA_PORTS:-无}"
 echo "UFW 放行 22: $([[ "${KEEP_PORT22}" == "yes" ]] && echo '暂时保留(建议验证后关闭)' || echo '未放行')"
 echo
 echo "重要：当前已设置 10 分钟 systemd 自动回滚保险丝。"
-echo "请立刻新开终端测试：ssh -p ${SSH_PORT} ${LOGIN_USER}@<服务器IP>"
-echo "确认一切正常后执行：sudo ./${SCRIPT_NAME} --confirm （默认会收紧 AllowUsers 只留 ${LOGIN_USER}）"
-echo "如不想收紧 AllowUsers：sudo ./${SCRIPT_NAME} --confirm --keep-allowusers"
+echo "请立刻新开终端测试："
+echo "  - 密码：ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no -p ${SSH_PORT} ${LOGIN_USER}@<服务器IP>"
+if [[ "$(cat "$KEYS_ENABLED_FILE")" == "yes" ]]; then
+  echo "  - 公钥：ssh -o PreferredAuthentications=publickey -p ${SSH_PORT} ${LOGIN_USER}@<服务器IP>"
+fi
+echo
+echo "确认一切正常后执行："
+echo "  - 收紧 AllowUsers：sudo ./${SCRIPT_NAME} --confirm"
+echo "  - 收紧 AllowUsers 且关闭密码（只留公钥）：sudo ./${SCRIPT_NAME} --confirm --disable-password"
+echo "  - 不收紧 AllowUsers：sudo ./${SCRIPT_NAME} --confirm --keep-allowusers"
+echo
 echo "如需查看回滚/确认日志：sudo tail -n 50 ${ROLLBACK_LOG}"
 echo "如果出现问题，可直接执行：sudo ./${SCRIPT_NAME} --rollback （一键回滚）"
 echo "============================================"
