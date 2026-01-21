@@ -90,12 +90,6 @@ ssh -o PreferredAuthentications=publickey -p <NEW_PORT> <USER>@<SERVER_IP>
 sudo ./secure_setup_password.sh --confirm
 ```
 
-如果你不想收紧（保留合并模式）：
-
-```bash
-sudo ./secure_setup_password.sh --confirm --keep-allowusers
-```
-
 ### 3）确认公钥可用后，关闭密码（更安全）
 
 ```bash
