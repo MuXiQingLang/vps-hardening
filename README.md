@@ -1,20 +1,33 @@
+
 # vps-hardening
 
-Ubuntu/Debian VPS 一键加固脚本（systemd），主要用于 SSH + 防火墙 + Fail2Ban 的基础安全加固。
+Ubuntu/Debian VPS 一键加固脚本（systemd），主要用于 SSH + 防火墙 + Fail2Ban 的基础安全加固，带“自动回滚保险丝”避免锁门。
 
-包含功能：
+---
+
+## 功能概览
 
 - 创建/确认普通登录用户（非 root）
-- 修改 SSH 端口
-- 禁止 root 直接 SSH 登录
+- 赋予该用户 sudo（需要密码，不是免密）
+- 修改 SSH 端口（新端口可选）
+- 禁止 root 直接 SSH 登录（PermitRootLogin no）
 - 仅允许指定用户登录（AllowUsers）
-- **密码登录模式**（禁用公钥登录）
-- UFW 防火墙：默认拒绝入站，仅放行 SSH 新端口 + 可选保留 22 + 可选额外业务端口
-- Fail2Ban：保护 SSH（按新端口监控）
+- 登录方式：
+  - 默认：**密码开启**（救援用，防止误锁）
+  - 可选：**启用公钥登录**（交互粘贴公钥写入 authorized_keys）
+  - 可选：确认无误后 **关闭密码仅保留公钥**（`--confirm --disable-password`）
+- UFW 防火墙：
+  - 默认拒绝入站、允许出站
+  - 放行：SSH 新端口
+  - 可选：临时保留 22（建议先保留，验证后再关）
+  - 可选：额外业务端口（逗号分隔）
+- Fail2Ban：
+  - 保护 SSH（按新端口监控）
+  - 自动封禁爆破/异常尝试 IP（可能会误封自己）
 - 自动回滚保险丝（默认 10 分钟）
 - 一键回滚（撤销脚本主要改动）
 
-> 注意：纯密码 SSH 的抗爆破能力弱于密钥方式。强烈建议配合强密码、限制来源 IP、云厂商安全组策略使用。
+> 建议：最终形态优先用“公钥登录 + 关闭密码 + 关闭 22 +（可选）限制来源 IP/安全组”。
 
 ---
 
@@ -29,111 +42,88 @@ Ubuntu/Debian VPS 一键加固脚本（systemd），主要用于 SSH + 防火墙
 
 ### 方式 A：下载后执行（推荐）
 
-> 先下载到服务器，最好看一眼脚本内容，再运行。
-
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MuXiQingLang/vps-hardening/main/secure_setup_password.sh -o secure_setup_password.sh
 chmod +x secure_setup_password.sh
 sudo ./secure_setup_password.sh
 ````
 
-脚本执行完后，请在**新终端**测试 SSH：
+脚本会交互询问：
+
+1. 登录用户名（建议非 root）
+2. SSH 新端口（建议 10000–65535）
+3. 是否保留 22（建议先 yes，确认后再关）
+4. 额外放行 TCP 端口（例如 `80,443,2334`）
+5. 是否启用公钥登录（建议 yes；随后粘贴公钥，多行可用，输入 `END` 结束）
+
+---
+
+## 非常重要：避免锁门流程
+
+脚本默认开启 **10 分钟自动回滚保险丝**。你必须在**新终端**验证登录正常后，再取消保险丝。
+
+### 1）新终端测试 SSH（推荐至少测一次密码/一次公钥）
 
 ```bash
 ssh -p <NEW_PORT> <USER>@<SERVER_IP>
 ```
 
-确认一切正常后，取消自动回滚保险丝（很重要）：
+如果你想明确指定只走某一种认证方式（可选）：
+
+* 仅密码：
+
+```bash
+ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no -p <NEW_PORT> <USER>@<SERVER_IP>
+```
+
+* 仅公钥：
+
+```bash
+ssh -o PreferredAuthentications=publickey -p <NEW_PORT> <USER>@<SERVER_IP>
+```
+
+### 2）确认无误后，取消保险丝 + 收紧 AllowUsers
+
+默认确认会把 AllowUsers 收紧为“只允许你创建/指定的用户”。
 
 ```bash
 sudo ./secure_setup_password.sh --confirm
 ```
 
-如出现问题，需要立刻回滚：
+如果你不想收紧（保留合并模式）：
 
 ```bash
-sudo ./secure_setup_password.sh --rollback
+sudo ./secure_setup_password.sh --confirm --keep-allowusers
 ```
+
+### 3）确认公钥可用后，关闭密码（更安全）
+
+```bash
+sudo ./secure_setup_password.sh --confirm --disable-password
+```
+
+脚本会在关闭密码前检查 `~<USER>/.ssh/authorized_keys` 是否存在且非空，避免误锁。
+
+### 4）验证新端口稳定后，再关闭 22（建议）
+
+默认 `--confirm` **不会**关闭 22。要关 22 用：
+
+```bash
+sudo ./secure_setup_password.sh --confirm --disable-22
+```
+
+它会尝试：
+
+* 从 UFW 删除 22 放行
+* 注释主配置里的 `Port 22`（让 sshd 不再监听 22）
+
+> 关闭 22 前请确保：你已经能稳定用新端口登录，并且云厂商安全组/防火墙也允许新端口。
 
 ---
 
-### 方式 B：一行命令直接跑（不推荐）
+## 一键回滚
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/MuXiQingLang/vps-hardening/main/secure_setup_password.sh | sudo bash
-```
-
-不推荐原因：不落地查看脚本内容，风险更高。更稳的做法是固定到某个 commit SHA 再运行。
-
----
-
-## 交互式输入说明
-
-运行脚本后会询问：
-
-1. 登录用户名：脚本会创建该用户或复用已有用户
-2. SSH 新端口：建议 10000–65535
-3. 是否保留 22：建议先保留，确认新端口可登录后再关闭
-4. 额外放行端口：逗号分隔，例如：`80,443,2334,8080`
-
-> 提醒：你服务器如果已经有业务端口（例如你之前 `ss` 里看到的 `xray` 监听 `2334/tcp`），一定要把对应端口加入“额外放行端口”，否则启用 UFW 后业务可能被拦截。
-
----
-
-## 重要：避免把自己锁在门外
-
-* **不要关闭当前 SSH 会话**
-* 脚本默认开启 **10 分钟自动回滚保险丝**
-* 你必须在新终端确认 `ssh -p 新端口 用户@IP` 可登录后，再执行：
-
-```bash
-sudo ./secure_setup_password.sh --confirm
-```
-
-否则到时间会自动回滚（恢复到更容易连上的状态）。
-
----
-
-## 防火墙端口放行建议
-
-如果你有网站/反代（Nginx/Caddy/Apache）：
-
-* 通常需要：`80,443`
-
-如果你运行了其他对外服务（示例）：
-
-* Xray：例如 `2334`
-* 自定义应用：例如 `8080`
-
-> 仅给反代使用的后端服务建议只监听 `127.0.0.1`，不对公网开放端口。
-
----
-
-## 查看当前端口占用
-
-在服务器执行：
-
-```bash
-sudo ss -lntup
-```
-
-如果使用 Docker：
-
-```bash
-docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}'
-```
-
----
-
-## 回滚说明
-
-### 取消保险丝（确认系统一切正常后执行）
-
-```bash
-sudo ./secure_setup_password.sh --confirm
-```
-
-### 一键回滚（SSH/UFW/Fail2Ban）
+### 立即回滚（SSH/UFW/Fail2Ban）
 
 ```bash
 sudo ./secure_setup_password.sh --rollback
@@ -141,8 +131,62 @@ sudo ./secure_setup_password.sh --rollback
 
 回滚会做的事（best-effort）：
 
-* 禁用 `/etc/ssh/sshd_config.d/99-hardening.conf`
-* 尝试还原/放开防火墙（优先还原 iptables 备份，否则 `ufw disable`）
-* 重启 SSH 服务
+* 禁用 `/etc/ssh/sshd_config.d/99-hardening.conf`（搬到 `/root` 留档）
+* 尝试还原/放开防火墙（优先 iptables 备份，否则 `ufw disable`）
+* 重启 SSH
 * 停止 Fail2Ban（避免误封）
 
+---
+
+## 查看状态/排错常用命令
+
+### 看 sshd 最终生效配置（强烈推荐用它判断“到底生效了啥”）
+
+```bash
+sudo sshd -T | egrep -i '^(port|permitrootlogin|passwordauthentication|pubkeyauthentication|kbdinteractiveauthentication|allowusers)\b'
+```
+
+### 看监听端口
+
+```bash
+sudo ss -lntp | grep sshd
+```
+
+### 看 UFW 放行
+
+```bash
+sudo ufw status verbose
+sudo ufw status numbered
+```
+
+### 看 Fail2Ban 是否封了谁（以及解封）
+
+```bash
+sudo fail2ban-client status sshd
+sudo fail2ban-client set sshd unbanip <YOUR_IP>
+```
+
+> 如果你在本机看到 `Connection closed by ...`，而服务器侧日志没进入到密码提示阶段，很可能是：
+>
+> * 你的 IP 被 Fail2Ban 封了
+> * 云安全组/外部防火墙没放行新端口
+> * sshd 实际没在新端口监听（配置没加载/被回滚/服务未重启）
+
+---
+
+## 关于“额外端口放行”的提醒
+
+如果你有网站/反代（Nginx/Caddy/Apache），通常需要：`80,443`。
+如果你运行其他对外服务（示例：Xray、面板、应用端口），把对应端口加到“额外放行端口”。
+
+建议：仅给反代使用的后端服务只监听 `127.0.0.1`，不要直接对公网开放。
+
+---
+
+## 安全建议（可选增强）
+
+* 最终使用：公钥登录 + 关闭密码 + 关闭 22
+* 配合云厂商安全组：仅允许你的管理 IP 访问 SSH 端口
+* 如果你经常换网（IP 变动大），可以先别做“只允许单 IP”，避免误锁
+
+```
