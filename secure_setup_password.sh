@@ -32,7 +32,7 @@ logi() { log_init; echo "[$1] $(date -Is) $2" >> "$ROLLBACK_LOG" 2>/dev/null || 
 # ---------------- helpers ----------------
 need_root() {
   if [ "${EUID:-$(id -u)}" -ne 0 ]; then
-    echo "请使用 root 权限运行：sudo ./${SCRIPT_NAME} [--confirm [--keep-allowusers] [--disable-password] [--disable-22] | --rollback]"
+    echo "请使用 root 权限运行：sudo ./${SCRIPT_NAME} [--confirm [--disable-password] [--disable-22] | --rollback]"
     exit 1
   fi
 }
@@ -42,16 +42,6 @@ svc_reload_ssh() {
     systemctl reload ssh || systemctl restart ssh
   elif systemctl list-unit-files | grep -q '^sshd\.service'; then
     systemctl reload sshd || systemctl restart sshd
-  else
-    systemctl restart ssh || systemctl restart sshd
-  fi
-}
-
-svc_restart_ssh() {
-  if systemctl list-unit-files | grep -q '^ssh\.service'; then
-    systemctl restart ssh
-  elif systemctl list-unit-files | grep -q '^sshd\.service'; then
-    systemctl restart sshd
   else
     systemctl restart ssh || systemctl restart sshd
   fi
@@ -78,7 +68,6 @@ ensure_sshd_include_dir() {
 }
 
 neutralize_cloudimg_passwordauth() {
-  # 云镜像常见：60-cloudimg-settings.conf 写死 PasswordAuthentication no，导致你以为开了密码其实最终是关的
   local f="/etc/ssh/sshd_config.d/60-cloudimg-settings.conf"
   if [[ -f "$f" ]] && grep -qE '^\s*PasswordAuthentication\s+no\b' "$f"; then
     echo "[INFO] 检测到 cloudimg 默认禁用密码登录：$f，正在注释该行以避免覆盖..."
@@ -105,19 +94,16 @@ chmod 600 "$ROLLBACK_LOG" 2>/dev/null || true
 echo "[ROLLBACK] $(date -Is) triggered user=$(id -un) pid=$$ ppid=$PPID" >> "$ROLLBACK_LOG"
 echo "[ROLLBACK] start" >> "$ROLLBACK_LOG"
 
-# 1) 禁用 SSH 加固文件（搬到 /root 留档）
 if [[ -f "$HARDEN_FILE" ]]; then
   mv "$HARDEN_FILE" "/root/99-hardening.conf.disabled.rollback.$(date +%F-%H%M%S)" || true
   echo "[ROLLBACK] disabled $HARDEN_FILE" >> "$ROLLBACK_LOG"
 fi
 
-# 2) 恢复主 sshd_config（撤销脚本插入的 Include）
 if [[ -f "$MAIN_SSHD_BACKUP" ]]; then
   cp -a "$MAIN_SSHD_BACKUP" "$MAIN_SSHD_CONFIG" || true
   echo "[ROLLBACK] restored $MAIN_SSHD_CONFIG from backup" >> "$ROLLBACK_LOG"
 fi
 
-# 3) 回滚/放开防火墙
 if command -v ufw >/dev/null 2>&1; then
   if [[ -s "$UFW_RULES_FILE" ]] && command -v iptables-restore >/dev/null 2>&1; then
     iptables-restore < "$UFW_RULES_FILE" || true
@@ -128,7 +114,6 @@ if command -v ufw >/dev/null 2>&1; then
   fi
 fi
 
-# 4) 重启 SSH 服务
 if systemctl list-unit-files | grep -q '^ssh\.service'; then
   systemctl restart ssh || true
 elif systemctl list-unit-files | grep -q '^sshd\.service'; then
@@ -138,7 +123,6 @@ else
 fi
 echo "[ROLLBACK] ssh restarted" >> "$ROLLBACK_LOG"
 
-# 5) 停止 fail2ban（避免误伤）
 if systemctl list-unit-files | grep -q '^fail2ban\.service'; then
   systemctl stop fail2ban || true
   echo "[ROLLBACK] fail2ban stopped" >> "$ROLLBACK_LOG"
@@ -173,7 +157,6 @@ set_rollback_fuse() {
     iptables-save > "$UFW_RULES_FILE" || true
   fi
 
-  # 先取消历史 unit，避免同机重复运行造成混乱
   cancel_rollback_fuse || true
 
   local unit="secure-setup-rollback-$(date +%s)"
@@ -225,7 +208,6 @@ compute_allowusers_merge() {
 }
 
 apply_harden_file() {
-  # 仅主流程使用：生成 hardening 文件；confirm 不再调用它（避免误改 Port）
   local ssh_port="$1"
   local allow_users="$2"
   local password_auth="$3"   # yes/no
@@ -243,7 +225,6 @@ Port ${ssh_port}
 # 合并模式：避免把已有可登录用户踢出门
 AllowUsers ${allow_users}
 
-# 确认 ${allow_users%% *} 可登录 + 可 sudo 后再长期保持
 PermitRootLogin no
 
 PasswordAuthentication ${password_auth}
@@ -263,8 +244,6 @@ EOF
 
 assert_sshd_listening_port() {
   local expected="$1"
-
-  # 不做“必须识别到 sshd 进程名”的强约束，避免 ss 输出差异导致误报
   if ss -lnt 2>/dev/null | awk -v p=":${expected}" '$1=="LISTEN" && index($4,p)>0 {ok=1} END{exit(ok?0:1)}'; then
     return 0
   fi
@@ -334,7 +313,6 @@ install_authorized_keys() {
   logi "INFO" "authorized_keys updated for user=$login_user file=$auth_keys"
 }
 
-# confirm helper: only edit necessary lines, NEVER touch Port in harden file
 confirm_edit_allowusers() {
   local allow_users_final="$1"
 
@@ -352,7 +330,6 @@ confirm_edit_allowusers() {
   logi "CONFIRM" "set AllowUsers in $HARDEN_FILE to '$allow_users_final' (no port change)"
 }
 
-# NEW: 同步主配置 AllowUsers，避免与 harden 合并导致 root/ubuntu 还在
 confirm_sync_main_allowusers() {
   local allow_users_final="$1"
 
@@ -368,7 +345,6 @@ confirm_sync_main_allowusers() {
     sed -i -E "s/^\s*AllowUsers\s+.*/AllowUsers ${allow_users_final}/" "$MAIN_SSHD_CONFIG"
     logi "CONFIRM" "synced AllowUsers in $MAIN_SSHD_CONFIG to '$allow_users_final' backup=$b"
   else
-    # 没有的话就追加一行（更保守：hardening 文件丢了也能继续限制）
     echo "" >> "$MAIN_SSHD_CONFIG"
     echo "AllowUsers ${allow_users_final}" >> "$MAIN_SSHD_CONFIG"
     logi "CONFIRM" "appended AllowUsers to $MAIN_SSHD_CONFIG value='$allow_users_final'"
@@ -376,13 +352,11 @@ confirm_sync_main_allowusers() {
 }
 
 confirm_disable_password_only() {
-  # only adjust auth settings; NEVER touch Port
   if [[ ! -f "$HARDEN_FILE" ]]; then
     echo "错误：$HARDEN_FILE 不存在，无法安全关闭密码登录。"
     exit 1
   fi
 
-  # ensure PubkeyAuthentication yes
   if grep -qE '^\s*PubkeyAuthentication\s+' "$HARDEN_FILE"; then
     sed -i -E 's/^\s*PubkeyAuthentication\s+.*/PubkeyAuthentication yes/' "$HARDEN_FILE"
   else
@@ -404,11 +378,9 @@ confirm_disable_password_only() {
   logi "CONFIRM" "disabled password auth (no port change)"
 }
 
-# NEW: 可选关闭 22（防火墙 + sshd 监听）
 confirm_disable_22() {
   echo "[CONFIRM] 正在关闭 22 端口（UFW + sshd 监听）..."
 
-  # 1) 先确保 harden 文件存在且包含非 22 的 Port（避免误锁门）
   if [[ ! -f "$HARDEN_FILE" ]] || ! grep -qE '^\s*Port\s+' "$HARDEN_FILE"; then
     echo "错误：$HARDEN_FILE 缺失或没有 Port 行，无法安全关闭 22。"
     exit 1
@@ -418,7 +390,6 @@ confirm_disable_22() {
     exit 1
   fi
 
-  # 2) UFW 删除 22 放行（按编号从大到小删，避免编号变化）
   if command -v ufw >/dev/null 2>&1; then
     local nums
     nums="$(
@@ -435,7 +406,6 @@ confirm_disable_22() {
     fi
   fi
 
-  # 3) 注释主配置里的 Port 22（只对 Port 22 动手）
   if grep -qE '^\s*Port\s+22\b' "$MAIN_SSHD_CONFIG"; then
     local b="${STATE_DIR}/sshd_config.before.confirm_disable22.$(date +%F-%H%M%S)"
     cp -a "$MAIN_SSHD_CONFIG" "$b"
@@ -448,15 +418,16 @@ confirm_disable_22() {
 need_root
 
 if [[ "${1:-}" == "--confirm" ]]; then
-  KEEP_ALLOWUSERS="no"
+  # confirm 只支持：收紧 + 可选关密码 + 可选关 22
   DISABLE_PASSWORD="no"
   DISABLE_22="no"
+  KEEP_ALLOWUSERS="no"  # 兼容旧参数，但会被忽略
 
   for a in "${@:2}"; do
     case "$a" in
-      --keep-allowusers) KEEP_ALLOWUSERS="yes" ;;
       --disable-password) DISABLE_PASSWORD="yes" ;;
       --disable-22) DISABLE_22="yes" ;;
+      --keep-allowusers) KEEP_ALLOWUSERS="yes" ;; # will be ignored
     esac
   done
 
@@ -469,25 +440,23 @@ if [[ "${1:-}" == "--confirm" ]]; then
   ensure_sshd_include_dir
   neutralize_cloudimg_passwordauth
 
-  # allowusers: tighten or keep merged
-  if [[ "$KEEP_ALLOWUSERS" != "yes" ]]; then
-    allow_users_final="${LOGIN_USER}"
-    echo "[CONFIRM] 收紧 AllowUsers -> 仅允许：${allow_users_final}"
-  else
-    allow_users_final="$(compute_allowusers_merge "$LOGIN_USER")"
-    echo "[CONFIRM] 保持 AllowUsers 合并模式：${allow_users_final}"
+  # --- 强制收紧（忽略 keep-allowusers）---
+  if [[ "$KEEP_ALLOWUSERS" == "yes" ]]; then
+    echo "[WARN] confirm 阶段将忽略 --keep-allowusers（避免把 root/ubuntu 等重新放回 AllowUsers），将强制收紧为：${LOGIN_USER}"
+    logi "WARN" "ignored --keep-allowusers in confirm; forced tighten to ${LOGIN_USER}"
   fi
+  allow_users_final="${LOGIN_USER}"
+  echo "[CONFIRM] 收紧 AllowUsers -> 仅允许：${allow_users_final}"
 
-  # 关键：同时改 harden + 主配置（避免合并把 root/ubuntu 带回来）
+  # 同步 harden + 主配置（避免 AllowUsers 叠加导致 root/ubuntu 还有效）
   confirm_edit_allowusers "$allow_users_final"
   confirm_sync_main_allowusers "$allow_users_final"
 
-  # disable password option: requires keys enabled and authorized_keys non-empty
   if [[ "$DISABLE_PASSWORD" == "yes" ]]; then
     keys_enabled="no"
     [[ -f "$KEYS_ENABLED_FILE" ]] && keys_enabled="$(cat "$KEYS_ENABLED_FILE" || echo no)"
     if [[ "$keys_enabled" != "yes" ]]; then
-      echo "错误：你要求 --disable-password，但你上次运行时未启用公钥登录（为避免锁门，拒绝执行）。"
+      echo "错误：你要求 --disable-password，但上次运行时未启用公钥登录（为避免锁门，拒绝执行）。"
       exit 1
     fi
     user_home="$(eval echo "~${LOGIN_USER}")"
@@ -500,7 +469,6 @@ if [[ "${1:-}" == "--confirm" ]]; then
     confirm_disable_password_only
   fi
 
-  # 可选关闭 22
   if [[ "$DISABLE_22" == "yes" ]]; then
     confirm_disable_22
   fi
@@ -574,7 +542,6 @@ fi
 
 grant_sudo_privilege "${LOGIN_USER}"
 
-# ---- keys ----
 : > "$KEYS_FILE" || true
 
 if [[ "$ENABLE_KEYS" == "yes" ]]; then
@@ -594,7 +561,6 @@ fi
 echo "[2/6] 写入 SSH 加固配置..."
 MERGED_ALLOW_USERS="$(compute_allowusers_merge "$LOGIN_USER")"
 
-# 默认：密码开启（救援用） + 公钥按选择开启；想只留公钥用 --confirm --disable-password
 if [[ "$(cat "$KEYS_ENABLED_FILE")" == "yes" ]]; then
   apply_harden_file "$SSH_PORT" "$MERGED_ALLOW_USERS" "yes" "yes" "yes"
 else
@@ -667,16 +633,12 @@ echo "UFW 放行 22: $([[ "${KEEP_PORT22}" == "yes" ]] && echo '暂时保留(建
 echo
 echo "重要：当前已设置 10 分钟 systemd 自动回滚保险丝。"
 echo "请立刻新开终端测试："
-echo "  - 密码：ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no -p ${SSH_PORT} ${LOGIN_USER}@<服务器IP>"
-if [[ "$(cat "$KEYS_ENABLED_FILE")" == "yes" ]]; then
-  echo "  - 公钥：ssh -o PreferredAuthentications=publickey -p ${SSH_PORT} ${LOGIN_USER}@<服务器IP>"
-fi
+echo "  - ssh -p ${SSH_PORT} ${LOGIN_USER}@<服务器IP>"
 echo
-echo "确认一切正常后执行："
+echo "确认一切正常后执行（会强制收紧 AllowUsers 为单用户）："
 echo "  - 收紧 AllowUsers：sudo ./${SCRIPT_NAME} --confirm"
 echo "  - 收紧 AllowUsers 且关闭密码（只留公钥）：sudo ./${SCRIPT_NAME} --confirm --disable-password"
 echo "  - 收紧 AllowUsers 并关闭 22（删UFW放行 + sshd不再监听22）：sudo ./${SCRIPT_NAME} --confirm --disable-22"
-echo "  - 不收紧 AllowUsers：sudo ./${SCRIPT_NAME} --confirm --keep-allowusers"
 echo
 echo "如需查看回滚/确认日志：sudo tail -n 50 ${ROLLBACK_LOG}"
 echo "如果出现问题，可直接执行：sudo ./${SCRIPT_NAME} --rollback （一键回滚）"
