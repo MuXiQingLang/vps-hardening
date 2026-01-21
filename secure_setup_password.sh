@@ -32,7 +32,7 @@ logi() { log_init; echo "[$1] $(date -Is) $2" >> "$ROLLBACK_LOG" 2>/dev/null || 
 # ---------------- helpers ----------------
 need_root() {
   if [ "${EUID:-$(id -u)}" -ne 0 ]; then
-    echo "请使用 root 权限运行：sudo ./${SCRIPT_NAME} [--confirm [--keep-allowusers] [--disable-password] | --rollback]"
+    echo "请使用 root 权限运行：sudo ./${SCRIPT_NAME} [--confirm [--keep-allowusers] [--disable-password] [--disable-22] | --rollback]"
     exit 1
   fi
 }
@@ -42,6 +42,16 @@ svc_reload_ssh() {
     systemctl reload ssh || systemctl restart ssh
   elif systemctl list-unit-files | grep -q '^sshd\.service'; then
     systemctl reload sshd || systemctl restart sshd
+  else
+    systemctl restart ssh || systemctl restart sshd
+  fi
+}
+
+svc_restart_ssh() {
+  if systemctl list-unit-files | grep -q '^ssh\.service'; then
+    systemctl restart ssh
+  elif systemctl list-unit-files | grep -q '^sshd\.service'; then
+    systemctl restart sshd
   else
     systemctl restart ssh || systemctl restart sshd
   fi
@@ -233,7 +243,7 @@ Port ${ssh_port}
 # 合并模式：避免把已有可登录用户踢出门
 AllowUsers ${allow_users}
 
-# 确认 muxi 可登录 + 可 sudo 后再长期保持
+# 确认 ${allow_users%% *} 可登录 + 可 sudo 后再长期保持
 PermitRootLogin no
 
 PasswordAuthentication ${password_auth}
@@ -254,23 +264,12 @@ EOF
 assert_sshd_listening_port() {
   local expected="$1"
 
-  # 最稳：用 ss 自带过滤器（iproute2 支持的话）
-  if ss -H -lntp "sport = :${expected}" 2>/dev/null | grep -qE '\bsshd\b'; then
+  # 不做“必须识别到 sshd 进程名”的强约束，避免 ss 输出差异导致误报
+  if ss -lnt 2>/dev/null | awk -v p=":${expected}" '$1=="LISTEN" && index($4,p)>0 {ok=1} END{exit(ok?0:1)}'; then
     return 0
   fi
 
-  # fallback 1：不依赖 users:(("sshd"...)) 的固定形态
-  if ss -H -lntp 2>/dev/null | grep -qE "LISTEN.*(:${expected})\b.*\bsshd\b"; then
-    return 0
-  fi
-
-  # fallback 2：如果权限/格式导致看不到进程名，就退一步只看端口 LISTEN（不推荐但比误判强）
-  if ss -H -lnt 2>/dev/null | grep -qE "LISTEN.*(:${expected})\b"; then
-    echo "[WARN] 仅检测到端口 ${expected} 在 LISTEN，但未能从 ss 输出识别到 sshd 进程名。"
-    return 0
-  fi
-
-  echo "错误：未检测到 sshd 在监听端口 ${expected}。"
+  echo "错误：未检测到端口 ${expected} 处于 LISTEN。"
   echo "调试信息："
   ss -lntp | grep -E "(:${expected}\b|sshd)" || true
   sshd -T 2>/dev/null | awk '$1=="port"{print}' || true
@@ -335,7 +334,7 @@ install_authorized_keys() {
   logi "INFO" "authorized_keys updated for user=$login_user file=$auth_keys"
 }
 
-# confirm helper: only edit necessary lines, NEVER touch Port
+# confirm helper: only edit necessary lines, NEVER touch Port in harden file
 confirm_edit_allowusers() {
   local allow_users_final="$1"
 
@@ -350,7 +349,30 @@ confirm_edit_allowusers() {
     printf "\nAllowUsers %s\n" "$allow_users_final" >> "$HARDEN_FILE"
   fi
 
-  logi "CONFIRM" "set AllowUsers='$allow_users_final' (no port change)"
+  logi "CONFIRM" "set AllowUsers in $HARDEN_FILE to '$allow_users_final' (no port change)"
+}
+
+# NEW: 同步主配置 AllowUsers，避免与 harden 合并导致 root/ubuntu 还在
+confirm_sync_main_allowusers() {
+  local allow_users_final="$1"
+
+  if [[ ! -f "$MAIN_SSHD_CONFIG" ]]; then
+    echo "警告：$MAIN_SSHD_CONFIG 不存在，跳过同步主配置 AllowUsers。"
+    logi "WARN" "main sshd_config missing; cannot sync AllowUsers"
+    return 0
+  fi
+
+  if grep -qE '^\s*AllowUsers\s+' "$MAIN_SSHD_CONFIG"; then
+    local b="${STATE_DIR}/sshd_config.before.confirm_allowusers.$(date +%F-%H%M%S)"
+    cp -a "$MAIN_SSHD_CONFIG" "$b"
+    sed -i -E "s/^\s*AllowUsers\s+.*/AllowUsers ${allow_users_final}/" "$MAIN_SSHD_CONFIG"
+    logi "CONFIRM" "synced AllowUsers in $MAIN_SSHD_CONFIG to '$allow_users_final' backup=$b"
+  else
+    # 没有的话就追加一行（更保守：hardening 文件丢了也能继续限制）
+    echo "" >> "$MAIN_SSHD_CONFIG"
+    echo "AllowUsers ${allow_users_final}" >> "$MAIN_SSHD_CONFIG"
+    logi "CONFIRM" "appended AllowUsers to $MAIN_SSHD_CONFIG value='$allow_users_final'"
+  fi
 }
 
 confirm_disable_password_only() {
@@ -382,17 +404,59 @@ confirm_disable_password_only() {
   logi "CONFIRM" "disabled password auth (no port change)"
 }
 
+# NEW: 可选关闭 22（防火墙 + sshd 监听）
+confirm_disable_22() {
+  echo "[CONFIRM] 正在关闭 22 端口（UFW + sshd 监听）..."
+
+  # 1) 先确保 harden 文件存在且包含非 22 的 Port（避免误锁门）
+  if [[ ! -f "$HARDEN_FILE" ]] || ! grep -qE '^\s*Port\s+' "$HARDEN_FILE"; then
+    echo "错误：$HARDEN_FILE 缺失或没有 Port 行，无法安全关闭 22。"
+    exit 1
+  fi
+  if grep -qE '^\s*Port\s+22\b' "$HARDEN_FILE"; then
+    echo "错误：检测到 $HARDEN_FILE 仍包含 Port 22，拒绝关闭 22（避免误判）。"
+    exit 1
+  fi
+
+  # 2) UFW 删除 22 放行（按编号从大到小删，避免编号变化）
+  if command -v ufw >/dev/null 2>&1; then
+    local nums
+    nums="$(
+      ufw status numbered 2>/dev/null | awk '
+        match($0,/^\[[[:space:]]*([0-9]+)\]/,m) && $0 ~ /(^|[[:space:]])22\/tcp([[:space:]]|$)/ {print m[1]}
+      ' | sort -rn
+    )"
+    if [[ -n "${nums}" ]]; then
+      while IFS= read -r n; do
+        [[ -z "$n" ]] && continue
+        ufw --force delete "$n" || true
+      done <<< "$nums"
+      logi "CONFIRM" "ufw removed allow rules for 22/tcp (numbers: ${nums//$'\n'/,})"
+    fi
+  fi
+
+  # 3) 注释主配置里的 Port 22（只对 Port 22 动手）
+  if grep -qE '^\s*Port\s+22\b' "$MAIN_SSHD_CONFIG"; then
+    local b="${STATE_DIR}/sshd_config.before.confirm_disable22.$(date +%F-%H%M%S)"
+    cp -a "$MAIN_SSHD_CONFIG" "$b"
+    sed -i -E 's/^\s*Port\s+22\b/# Port 22 (disabled by --disable-22)/' "$MAIN_SSHD_CONFIG"
+    logi "CONFIRM" "commented Port 22 in $MAIN_SSHD_CONFIG backup=$b"
+  fi
+}
+
 # ---------------- args ----------------
 need_root
 
 if [[ "${1:-}" == "--confirm" ]]; then
   KEEP_ALLOWUSERS="no"
   DISABLE_PASSWORD="no"
+  DISABLE_22="no"
 
   for a in "${@:2}"; do
     case "$a" in
       --keep-allowusers) KEEP_ALLOWUSERS="yes" ;;
       --disable-password) DISABLE_PASSWORD="yes" ;;
+      --disable-22) DISABLE_22="yes" ;;
     esac
   done
 
@@ -401,12 +465,6 @@ if [[ "${1:-}" == "--confirm" ]]; then
   [[ -s "$USER_FILE" ]] || { echo "没有找到上次运行的状态文件：$USER_FILE"; exit 1; }
   LOGIN_USER="$(cat "$USER_FILE")"
   valid_username_or_exit "$LOGIN_USER"
-
-  # confirm 不应该依赖端口状态来改配置，但我们仍检查状态是否存在用于提示
-  if [[ ! -s "$SSH_PORT_FILE" ]]; then
-    echo "警告：缺少端口状态文件 $SSH_PORT_FILE。confirm 将不会修改端口，仅处理 AllowUsers/认证项。"
-    logi "WARN" "missing $SSH_PORT_FILE during confirm"
-  fi
 
   ensure_sshd_include_dir
   neutralize_cloudimg_passwordauth
@@ -420,7 +478,9 @@ if [[ "${1:-}" == "--confirm" ]]; then
     echo "[CONFIRM] 保持 AllowUsers 合并模式：${allow_users_final}"
   fi
 
+  # 关键：同时改 harden + 主配置（避免合并把 root/ubuntu 带回来）
   confirm_edit_allowusers "$allow_users_final"
+  confirm_sync_main_allowusers "$allow_users_final"
 
   # disable password option: requires keys enabled and authorized_keys non-empty
   if [[ "$DISABLE_PASSWORD" == "yes" ]]; then
@@ -438,6 +498,11 @@ if [[ "${1:-}" == "--confirm" ]]; then
     fi
     echo "[CONFIRM] 关闭密码登录，仅保留公钥登录。"
     confirm_disable_password_only
+  fi
+
+  # 可选关闭 22
+  if [[ "$DISABLE_22" == "yes" ]]; then
+    confirm_disable_22
   fi
 
   sshd -t
@@ -610,6 +675,7 @@ echo
 echo "确认一切正常后执行："
 echo "  - 收紧 AllowUsers：sudo ./${SCRIPT_NAME} --confirm"
 echo "  - 收紧 AllowUsers 且关闭密码（只留公钥）：sudo ./${SCRIPT_NAME} --confirm --disable-password"
+echo "  - 收紧 AllowUsers 并关闭 22（删UFW放行 + sshd不再监听22）：sudo ./${SCRIPT_NAME} --confirm --disable-22"
 echo "  - 不收紧 AllowUsers：sudo ./${SCRIPT_NAME} --confirm --keep-allowusers"
 echo
 echo "如需查看回滚/确认日志：sudo tail -n 50 ${ROLLBACK_LOG}"
