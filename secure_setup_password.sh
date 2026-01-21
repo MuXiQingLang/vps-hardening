@@ -253,15 +253,26 @@ EOF
 
 assert_sshd_listening_port() {
   local expected="$1"
-  if ss -lntp 2>/dev/null | awk -v p=":$expected" '
-      $1=="LISTEN" && index($4,p)>0 && $0 ~ /users:\(\("sshd"/ { ok=1 }
-      END { exit(ok?0:1) }
-    '; then
+
+  # 最稳：用 ss 自带过滤器（iproute2 支持的话）
+  if ss -H -lntp "sport = :${expected}" 2>/dev/null | grep -qE '\bsshd\b'; then
+    return 0
+  fi
+
+  # fallback 1：不依赖 users:(("sshd"...)) 的固定形态
+  if ss -H -lntp 2>/dev/null | grep -qE "LISTEN.*(:${expected})\b.*\bsshd\b"; then
+    return 0
+  fi
+
+  # fallback 2：如果权限/格式导致看不到进程名，就退一步只看端口 LISTEN（不推荐但比误判强）
+  if ss -H -lnt 2>/dev/null | grep -qE "LISTEN.*(:${expected})\b"; then
+    echo "[WARN] 仅检测到端口 ${expected} 在 LISTEN，但未能从 ss 输出识别到 sshd 进程名。"
     return 0
   fi
 
   echo "错误：未检测到 sshd 在监听端口 ${expected}。"
-  ss -lntp | grep sshd || true
+  echo "调试信息："
+  ss -lntp | grep -E "(:${expected}\b|sshd)" || true
   sshd -T 2>/dev/null | awk '$1=="port"{print}' || true
   exit 1
 }
